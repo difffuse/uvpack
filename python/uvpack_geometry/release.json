@@ -1,0 +1,28 @@
+{
+  "metadata_schema": 1,
+  "dialect": "uvpack",
+  "version": "0.4.0.dev1",
+  "protocol_api": 1,
+  "companion_api": 1,
+  "operations": ["pack", "validate", "normalize"],
+  "validation_precisions": ["float64", "float32"],
+  "packing_precisions": ["float64", "float32"],
+  "capabilities": [
+    "packing_transforms_v1",
+    "input_policy_v1",
+    "complete_result_v1",
+    "original_area_density_v1",
+    "uniform_layout_density_v1",
+    "hull_policy_v1",
+    "stored_validation_v1",
+    "float32_validation_v1",
+    "float32_packing_v1",
+    "emitted_geometry_validation_v1",
+    "validate_operation_v1",
+    "request_cancellation_v1",
+    "validation_cancellation_v1",
+    "cancel_file_v1",
+    "normalize_operation_v1",
+    "fixed_chart_density_v1"
+  ]
+}

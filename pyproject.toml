@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uvpack-geometry"
+dynamic = ["version"]
+description = "Standalone mesh extraction and layout application for UVPack"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.dynamic]
+version = {attr = "uvpack_geometry.__version__"}
+
+[tool.setuptools.package-data]
+uvpack_geometry = ["release.json"]

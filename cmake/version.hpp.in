@@ -1,0 +1,9 @@
+#pragma once
+// Generated from python/uvpack_geometry/release.json. Do not edit this output.
+namespace uvpack::metadata {
+inline constexpr const char* dialect = "@UVPACK_DIALECT@";
+inline constexpr const char* version = "@UVPACK_VERSION@";
+inline constexpr int protocol_api = @UVPACK_PROTOCOL_API@;
+inline constexpr int companion_api = @UVPACK_COMPANION_API@;
+inline constexpr const char* json = R"uvpack_metadata(@UVPACK_RELEASE_JSON@)uvpack_metadata";
+}

@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+include("${CMAKE_CURRENT_LIST_DIR}/uvpackTargets.cmake")
+set(uvpack_VERSION "@UVPACK_VERSION@")
+set_and_check(uvpack_PYTHON_DIR "@PACKAGE_CMAKE_INSTALL_DATADIR@/uvpack/python")
+check_required_components(uvpack)

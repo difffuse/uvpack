@@ -1,0 +1,491 @@
+#version 450
+// Every float that feeds a cost is `precise` and written as plain multiplies and adds:
+// Vulkan guarantees those correctly rounded, forbids fusing them under `precise`, and
+// leaves fma() and division to the driver (fused or not, 2.5 ULP). The CPU reference
+// (gpu_reference.cpp, built with contraction off) evaluates the same expressions in
+// the same order, so costs agree to the bit and equal-cost ties break the same way
+// on every device. Without this, llvmpipe (Mesa) and the M2 chose different tied
+// orientations.
+// One whole greedy packing trial per workgroup.
+//
+// The workgroup is persistent for the length of the trial. It walks the trial's island
+// order; for every island it enumerates the unmasked orientations, splits that
+// orientation's candidate rows across the threads, runs a collision jump search per
+// row against its own private canvas, scores the clear locations with the location
+// cost, reduces to the best (orientation, row, x) with first-win ties, and
+// commits the winner into the canvas before moving on. No host round trip per island.
+//
+// The canvas is a bitmask: `bitCount` bits across the frame width (2^-12 by default)
+// times 8 vertical bands per stripe row plus a ninth plane holding their union,
+// band-minor so one word's planes are contiguous. Every interval - the canvas's and
+// the islands' - is rounded OUTWARD onto that grid, so a placement this kernel calls
+// clear is clear in the continuous domain as well. src/gpu_reference.cpp is the CPU
+// twin of everything below and the tests compare the two.
+//
+// What makes it affordable is the same pruning the CPU greedy uses, not raw threads:
+//
+//   * The cost has an exact lower bound per row that only grows with the row, so the
+//     incumbent turns into a closed-form ceiling on the highest row worth examining.
+//     Rows are therefore taken in WAVES that start small (16) and double: a wave
+//     refreshes the incumbent, and the next wave is clipped to the new ceiling. A
+//     workgroup that brute-forced 256 rows per orientation did ~40x the work of the
+//     CPU greedy, which stops at the first row that cannot win.
+//   * The hungriest island row alone is a relaxation of the whole island: its own
+//     first clear offset bounds the island's from below, and its failure rules the
+//     candidate row out outright. One probe warm-starts (or kills) the full search.
+//   * A canvas row's last occupied bit answers both "can this row collide at all"
+//     and the exact left clearance in one load.
+//
+// One dispatch covers a LADDER of scales, not one. Each trial carries its own usable
+// frame inside the shared bit grid; packing the same islands into a smaller frame and
+// scaling the whole layout back up to the target is the same rescale the CPU fast pass
+// uses, and it only ever grows the gaps. So one upload of one scale's rasters yields
+// as many effective scales as there are trials, which is what lets the device run a
+// bracket of its own next to the CPU's.
+//
+// Not done here: sub-row sub_rows, obstacles, several tiles, group compactness. Those
+// stay on the CPU; see gpu::unsupported_reason.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+const uint LOCAL = 64u;
+const uint BANDS = 8u;
+const uint PLANES = 9u;      // Eight bands plus their union.
+const uint UNION = 8u;
+const uint FIRST_WAVE = 16u;
+const uint NO_BIT = 0xFFFFFFFFu;
+const uint EMPTY_ROW = 0xFFFFFFFFu;
+const float FLOAT_MAX = 3.402823466e+38;
+
+struct OrientationT {
+    uint rowBegin;
+    uint rowCount;
+    float width;
+    float height;
+    int maxOffsetBits;
+    int lastRow;
+    uint probeRow;   // Row with the longest single segment: the relaxation probe.
+    float invHeight; // 1 / height from the host: no division on the device (2.5 ULP).
+};
+
+layout(binding = 0, std430) readonly buffer IslandTable { uvec2 v[]; } islands;
+layout(binding = 1, std430) readonly buffer Orientations { OrientationT v[]; } orientations;
+layout(binding = 2, std430) readonly buffer RowStart { uint v[]; } rowStart;
+layout(binding = 3, std430) readonly buffer RowFirstBit { uint v[]; } rowFirstBit;
+layout(binding = 4, std430) readonly buffer Intervals { uvec4 v[]; } intervals;
+layout(binding = 5, std430) readonly buffer Plans { uint v[]; } plans;
+layout(binding = 6, std430) coherent buffer Canvas { uint v[]; } canvas;
+layout(binding = 7, std430) coherent buffer RowMaxEnd { uint v[]; } rowMaxEnd;
+layout(binding = 8, std430) writeonly buffer Results { uint v[]; } results;
+
+layout(push_constant) uniform Push {
+    uint bitCount;
+    uint wordsPerRow;
+    uint canvasRows;
+    uint islandCount;
+    uint trialCount;
+    uint resultStride;
+    uint planStride;
+    float frameWidth;
+    float frameHeight;
+    float scanWidth;
+    float bitWidth;
+    float initialOccupiedWidth;
+    float initialOccupiedHeight;
+} pc;
+
+shared float s_cost[LOCAL];
+shared uint s_key[LOCAL];
+shared uint s_x[LOCAL];
+shared float s_bestCost;
+shared uint s_bestKey;
+shared uint s_bestX;
+shared float s_occupiedWidth;
+shared float s_occupiedHeight;
+shared uint s_failed;
+shared uint s_placed;
+
+uint g_canvasBase;
+uint g_maxEndBase;
+float g_frameWidth;   // This trial's usable frame inside the shared bit grid.
+float g_frameHeight;
+
+uint maskFrom(uint low) { return low >= 32u ? 0u : (0xFFFFFFFFu << low); }
+uint maskUpto(uint high) { return high >= 31u ? 0xFFFFFFFFu : ((1u << (high + 1u)) - 1u); }
+
+// OR of the bands [bl, bh] of one canvas word; the full range is one stored plane.
+uint bandWord(uint row, uint word, uint bl, uint bh) {
+    uint base = g_canvasBase + (row * pc.wordsPerRow + word) * PLANES;
+    if (bl == 0u && bh == BANDS - 1u) return canvas.v[base + UNION];
+    uint acc = 0u;
+    for (uint b = bl; b <= bh; ++b) acc |= canvas.v[base + b];
+    return acc;
+}
+
+// First occupied bit of `row` in [from, limit) within the bands, or NO_BIT. Callers
+// pass the row's last occupied bit as the limit: nothing is set at or beyond it, so a
+// search that has run past the occupancy stops instead of walking the whole frame.
+uint scanForward(uint row, uint bl, uint bh, uint from, uint limit) {
+    if (from >= limit) return NO_BIT;
+    uint w = from >> 5u;
+    uint last = (limit - 1u) >> 5u;
+    uint acc = bandWord(row, w, bl, bh) & maskFrom(from & 31u);
+    while (true) {
+        if (w == last) acc &= ((limit & 31u) == 0u) ? 0xFFFFFFFFu : maskUpto((limit - 1u) & 31u);
+        if (acc != 0u) return (w << 5u) + uint(findLSB(acc));
+        if (w >= last) return NO_BIT;
+        w += 1u;
+        acc = bandWord(row, w, bl, bh);
+    }
+}
+
+// First free bit of `row` at or after `from`. Everything at or beyond the row's last
+// occupied bit `end` is free, so that is both the bound and the answer past it.
+uint scanClear(uint row, uint bl, uint bh, uint from, uint end) {
+    if (from >= end) return from;
+    uint w = from >> 5u;
+    uint last = (end - 1u) >> 5u;
+    uint inv = (~bandWord(row, w, bl, bh)) & maskFrom(from & 31u);
+    while (inv == 0u) {
+        if (w >= last) return end;
+        w += 1u;
+        inv = ~bandWord(row, w, bl, bh);
+    }
+    return min(end, (w << 5u) + uint(findLSB(inv)));
+}
+
+// The displacement one island row needs at `offset`, or 0 when it is clear there.
+// NO_BIT means it can never be clear at or below `maxOffset`. `rowBegin` and the
+// canvas row are passed in: re-reading the orientation struct once per island row was
+// the most expensive thing this loop did.
+uint rowDisplacement(uint rowBegin, uint i, uint br, uint offset, uint maxOffset) {
+    uint first = rowFirstBit.v[rowBegin + i];
+    if (first == EMPTY_ROW) return 0u;
+    // One load settles both the "cannot collide" case and the scan bounds below.
+    uint end = rowMaxEnd.v[g_maxEndBase + br];
+    if (first + offset >= end) return 0u;
+    uint kb = rowStart.v[rowBegin + i];
+    uint ke = rowStart.v[rowBegin + i + 1u];
+    for (uint k = kb; k < ke; ++k) {
+        uvec4 iv = intervals.v[k];
+        uint lo = iv.x + offset;
+        uint hi = min(iv.y + offset, end);
+        uint hit = scanForward(br, iv.z, iv.w, lo, hi);
+        if (hit == NO_BIT) continue;
+        // Clear the occupied run this segment landed on, then skip any following free
+        // run shorter than the segment: it cannot hold the segment either.
+        uint len = iv.y - iv.x;
+        uint q = scanClear(br, iv.z, iv.w, hit, end);
+        while (true) {
+            uint nx = scanForward(br, iv.z, iv.w, q, end);
+            if (nx == NO_BIT || (nx - q) >= len) break;
+            q = scanClear(br, iv.z, iv.w, nx, end);
+        }
+        uint next = q - iv.x;
+        if (next > maxOffset || next <= offset) return NO_BIT;
+        return next - offset;
+    }
+    return 0u;
+}
+
+// The relaxation: the first offset at or above `start` where island row `i` alone is
+// clear. Bounds the full search from below; NO_BIT proves the whole island cannot fit.
+uint rowClear(uint rowBegin, uint i, uint row, uint start, uint maxOffset) {
+    uint offset = start;
+    while (true) {
+        uint jump = rowDisplacement(rowBegin, i, row + i, offset, maxOffset);
+        if (jump == NO_BIT) return NO_BIT;
+        if (jump == 0u) return offset;
+        offset += jump;
+        if (offset > maxOffset) return NO_BIT;
+    }
+}
+
+// Smallest x (in bits) at which the orientation, first row at `row`, hits nothing.
+uint firstClear(uint oi, uint row, uint maxOffset) {
+    OrientationT o = orientations.v[oi];
+    uint rowBegin = o.rowBegin;
+    // Island rows above the occupancy can never collide, so they leave the sweep.
+    uint count = row < pc.canvasRows ? min(o.rowCount, pc.canvasRows - row) : 0u;
+    if (count == 0u) return 0u;
+    uint offset = o.probeRow < count ? rowClear(rowBegin, o.probeRow, row, 0u, maxOffset) : 0u;
+    if (offset == NO_BIT) return NO_BIT;
+    uint witness = NO_BIT;
+    // Every collision moves the offset strictly right, so this terminates.
+    for (uint guard = 0u; guard <= maxOffset + 1u; ++guard) {
+        // A stack of island rows sliding along one obstacle keeps colliding in the same
+        // place, so re-probing the row that blocked last time usually skips the sweep.
+        if (witness != NO_BIT) {
+            uint jump = rowDisplacement(rowBegin, witness, row + witness, offset, maxOffset);
+            if (jump == NO_BIT) return NO_BIT;
+            if (jump > 0u) {
+                offset += jump;
+                if (offset > maxOffset) return NO_BIT;
+                continue;
+            }
+        }
+        bool collided = false;
+        for (uint i = 0u; i < count; ++i) {
+            if (i == witness) continue;
+            uint jump = rowDisplacement(rowBegin, i, row + i, offset, maxOffset);
+            if (jump == NO_BIT) return NO_BIT;
+            if (jump == 0u) continue;
+            witness = i;
+            offset += jump;
+            if (offset > maxOffset) return NO_BIT;
+            collided = true;
+            break;
+        }
+        if (!collided) return offset;
+    }
+    return NO_BIT;
+}
+
+// The clearance sum, accumulated in the shader's 32 lanes and in lane order.
+float clearanceSum(uint oi, uint row, uint offset) {
+    OrientationT o = orientations.v[oi];
+    precise float sum = 0.0;
+    for (uint lane = 0u; lane < 32u; ++lane) {
+        precise float acc = 0.0;
+        for (uint i = lane; i < o.rowCount; i += 32u) {
+            uint first = rowFirstBit.v[o.rowBegin + i];
+            if (first == EMPTY_ROW) continue;
+            uint left = first + offset;
+            uint previousEnd = 0u;
+            uint br = row + i;
+            if (br < pc.canvasRows && left > 0u) {
+                uint end = rowMaxEnd.v[g_maxEndBase + br];
+                if (left >= end) {
+                    // The row's last occupied bit IS end - 1, so this is exact.
+                    previousEnd = end;
+                } else {
+                    uint l = min(left, pc.bitCount);
+                    int w = int((l - 1u) >> 5u);
+                    uint bits = bandWord(br, uint(w), 0u, BANDS - 1u) & maskUpto((l - 1u) & 31u);
+                    while (bits == 0u && w > 0) {
+                        w -= 1;
+                        bits = bandWord(br, uint(w), 0u, BANDS - 1u);
+                    }
+                    if (bits != 0u) previousEnd = (uint(w) << 5u) + uint(findMSB(bits)) + 1u;
+                }
+            }
+            acc = float(left - previousEnd) * pc.bitWidth + acc;
+        }
+        sum += acc;
+    }
+    return sum;
+}
+
+// The cost rule of placement.hpp: how much the placement grows the occupied canvas,
+// as a fraction of the frame, and then how far from the bottom-left corner it sits.
+// Both terms are multiplied through by the frame's area, which is what keeps division
+// out of the kernel. src/gpu_reference.cpp writes the same expression in the same
+// order and the two answers must agree to the bit.
+float locationCost(uint oi, uint row, uint offset, float clearance, float occW, float occH) {
+    OrientationT o = orientations.v[oi];
+    precise float right = float(offset) * pc.bitWidth + o.width;
+    precise float top = float(row) * pc.scanWidth + o.height;
+    if (right > g_frameWidth || top > g_frameHeight) return FLOAT_MAX;
+    precise float dx = max(right - occW, 0.0);
+    precise float dy = max(top - occH, 0.0);
+    precise float growth = max(dx * g_frameHeight, dy * g_frameWidth);
+    precise float meanClearance = (clearance * pc.scanWidth) * o.invHeight;
+    precise float settle = (float(row) * pc.scanWidth) * g_frameWidth + meanClearance * g_frameHeight;
+    precise float total = 100000.0 * growth + settle;
+    return total;
+}
+
+// The exact per-row lower bound of that cost: the width overhang and the clearance are
+// both nonnegative, so only the height overhang and the row's own height survive.
+float rowLowerBound(float height, float occH, float y) {
+    precise float bound = g_frameWidth * (100000.0 * max(0.0, y + height - occH) + y);
+    return bound;
+}
+
+// Closed form of "the highest row whose lower bound can still beat `best`". Only ever
+// an upper bound: the per-row test above stays the authority, this just clips the loop.
+int rowCeiling(float height, float occH, float best) {
+    if (!(best < FLOAT_MAX)) return 0x3FFFFFFF;
+    precise float b = best / g_frameWidth;       // The bound in units of one frame width.
+    precise float slack = occH - height;
+    precise float ylim = (b <= max(slack, 0.0)) ? b : ((b + 100000.0 * slack) / 100001.0);
+    if (!(ylim > 0.0)) return 0;          // Only row 0 can possibly still win.
+    precise float r = ceil(ylim / pc.scanWidth);  // One row of slack absorbs float disagreement.
+    return int(min(r, 1.0e9));
+}
+
+// Each invocation owns whole canvas rows, so the read-modify-write needs no atomics.
+void commitIsland(uint oi, uint row, uint offset) {
+    OrientationT o = orientations.v[oi];
+    for (uint i = gl_LocalInvocationID.x; i < o.rowCount; i += LOCAL) {
+        uint br = row + i;
+        if (br >= pc.canvasRows) continue;
+        uint kb = rowStart.v[o.rowBegin + i];
+        uint ke = rowStart.v[o.rowBegin + i + 1u];
+        uint maxEnd = rowMaxEnd.v[g_maxEndBase + br];
+        for (uint k = kb; k < ke; ++k) {
+            uvec4 iv = intervals.v[k];
+            uint lo = min(iv.x + offset, pc.bitCount);
+            uint hi = min(iv.y + offset, pc.bitCount);
+            if (hi <= lo) continue;
+            uint bit = lo;
+            while (bit < hi) {
+                uint w = bit >> 5u;
+                uint top = min(hi, (w + 1u) << 5u);
+                uint mask = maskFrom(bit & 31u);
+                if ((top & 31u) != 0u) mask &= maskUpto((top - 1u) & 31u);
+                uint base = g_canvasBase + (br * pc.wordsPerRow + w) * PLANES;
+                for (uint b = iv.z; b <= iv.w; ++b) canvas.v[base + b] |= mask;
+                canvas.v[base + UNION] |= mask;
+                bit = top;
+            }
+            maxEnd = max(maxEnd, hi);
+        }
+        rowMaxEnd.v[g_maxEndBase + br] = maxEnd;
+    }
+}
+
+void main() {
+    uint trial = gl_WorkGroupID.x;
+    if (trial >= pc.trialCount) return;
+    uint tid = gl_LocalInvocationID.x;
+    g_canvasBase = trial * pc.canvasRows * pc.wordsPerRow * PLANES;
+    g_maxEndBase = trial * pc.canvasRows;
+
+    uint canvasWords = pc.canvasRows * pc.wordsPerRow * PLANES;
+    for (uint i = tid; i < canvasWords; i += LOCAL) canvas.v[g_canvasBase + i] = 0u;
+    for (uint i = tid; i < pc.canvasRows; i += LOCAL) rowMaxEnd.v[g_maxEndBase + i] = 0u;
+    if (tid == 0u) {
+        s_occupiedWidth = pc.initialOccupiedWidth;
+        s_occupiedHeight = pc.initialOccupiedHeight;
+        s_failed = 0u;
+        s_placed = 0u;
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    uint planBase = trial * pc.planStride;
+    g_frameWidth = uintBitsToFloat(plans.v[planBase + 0u]);
+    g_frameHeight = uintBitsToFloat(plans.v[planBase + 1u]);
+    uint orderBase = planBase + 2u;
+    uint skipBase = orderBase + pc.islandCount;
+    uint resultBase = trial * pc.resultStride;
+
+    for (uint n = 0u; n < pc.islandCount; ++n) {
+        uint island = plans.v[orderBase + n];
+        uint skip = plans.v[skipBase + island];
+        if (tid == 0u) {
+            s_bestCost = FLOAT_MAX;
+            s_bestKey = NO_BIT;
+            s_bestX = 0u;
+        }
+        barrier();
+        uint obase = islands.v[island].x;
+        uint ocount = islands.v[island].y;
+        for (uint o = 0u; o < ocount; ++o) {
+            if ((skip & (1u << o)) != 0u) continue;
+            OrientationT orient = orientations.v[obase + o];
+            // The frame is per trial, so the two fit bounds are too.
+            if (orient.width > g_frameWidth || orient.height > g_frameHeight) continue;
+            int lastRowSigned = int(floor((g_frameHeight - orient.height) / pc.scanWidth));
+            if (lastRowSigned < 0) continue;
+            uint lastRow = uint(min(lastRowSigned, int(pc.canvasRows) - 1));
+            int maxOffsetSigned = int(floor((g_frameWidth - orient.width) / pc.bitWidth));
+            if (maxOffsetSigned < 0) continue;
+            uint maxOffset = min(uint(maxOffsetSigned), pc.bitCount);
+            uint row = 0u;
+            uint wave = FIRST_WAVE;
+            while (true) {
+                // Clip the wave to the rows that can still beat the incumbent. Both
+                // shared reads are stable here: every thread agrees, so the exits are
+                // uniform and the barriers below stay well defined.
+                int ceiling = rowCeiling(orient.height, s_occupiedHeight, s_bestCost);
+                uint stop = min(lastRow, uint(max(ceiling, 0)));
+                if (row > stop) break;
+                uint span = min(wave, stop - row + 1u);
+
+                float cost = FLOAT_MAX;
+                uint key = NO_BIT;
+                uint xbits = 0u;
+                if (tid < span) {
+                    uint candidate = row + tid;
+                    precise float y = float(candidate) * pc.scanWidth;
+                    if (rowLowerBound(orient.height, s_occupiedHeight, y) < s_bestCost) {
+                        uint offset = firstClear(obase + o, candidate, maxOffset);
+                        if (offset != NO_BIT) {
+                            float clearance = clearanceSum(obase + o, candidate, offset);
+                            float c = locationCost(obase + o, candidate, offset, clearance,
+                                                   s_occupiedWidth, s_occupiedHeight);
+                            if (c < FLOAT_MAX) {
+                                cost = c;
+                                key = (o << 21u) | candidate;
+                                xbits = offset;
+                            }
+                        }
+                    }
+                }
+                s_cost[tid] = cost;
+                s_key[tid] = key;
+                s_x[tid] = xbits;
+                barrier();
+                uint reduction = 1u;
+                while (reduction < span) reduction <<= 1u;
+                for (uint stride = reduction >> 1u; stride > 0u; stride >>= 1u) {
+                    if (tid < stride) {
+                        bool take = (s_cost[tid + stride] < s_cost[tid]) ||
+                                    (s_cost[tid + stride] == s_cost[tid] && s_key[tid + stride] < s_key[tid]);
+                        if (take) {
+                            s_cost[tid] = s_cost[tid + stride];
+                            s_key[tid] = s_key[tid + stride];
+                            s_x[tid] = s_x[tid + stride];
+                        }
+                    }
+                    barrier();
+                }
+                if (tid == 0u && s_key[0] != NO_BIT) {
+                    // First win on ties: orientations and rows are both enumerated in
+                    // increasing key order, so an equal cost never displaces the incumbent.
+                    if (s_cost[0] < s_bestCost || (s_cost[0] == s_bestCost && s_key[0] < s_bestKey)) {
+                        s_bestCost = s_cost[0];
+                        s_bestKey = s_key[0];
+                        s_bestX = s_x[0];
+                    }
+                }
+                barrier();
+                row += span;
+                wave = min(wave * 2u, LOCAL);
+            }
+        }
+        if (s_bestKey == NO_BIT) {
+            if (tid == 0u) s_failed = 1u;
+            barrier();
+            break;
+        }
+        uint chosen = s_bestKey >> 21u;
+        uint chosenRow = s_bestKey & 0x1FFFFFu;
+        uint chosenX = s_bestX;
+        commitIsland(obase + chosen, chosenRow, chosenX);
+        memoryBarrierBuffer();
+        barrier();
+        if (tid == 0u) {
+            OrientationT orient = orientations.v[obase + chosen];
+            precise float grownW = max(s_occupiedWidth, float(chosenX) * pc.bitWidth + orient.width);
+            precise float grownH = max(s_occupiedHeight, float(chosenRow) * pc.scanWidth + orient.height);
+            s_occupiedWidth = grownW;
+            s_occupiedHeight = grownH;
+            uint slot = resultBase + 4u + n * 4u;
+            results.v[slot + 0u] = island;
+            results.v[slot + 1u] = chosen;
+            results.v[slot + 2u] = chosenRow;
+            results.v[slot + 3u] = chosenX;
+            s_placed = n + 1u;
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        results.v[resultBase + 0u] = s_failed == 0u ? 1u : 0u;
+        results.v[resultBase + 1u] = s_placed;
+        results.v[resultBase + 2u] = floatBitsToUint(s_occupiedWidth);
+        results.v[resultBase + 3u] = floatBitsToUint(s_occupiedHeight);
+    }
+}
